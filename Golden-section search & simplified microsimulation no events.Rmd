@@ -1,0 +1,796 @@
+---
+title: "Golden-section search & simplified microsimulation simulation"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+date: "2025-07-13"
+Author: R. Rhellab BSc, K.M. Veen MD, PhD
+---
+
+# 01 Clear memory and notation settings
+```{r}
+rm(list = ls())       # clear memory (removes all the variables from the work space)
+options(scipen = 999) # prevents R from using scientific notation for numbers
+```
+
+
+# 02 Load packages
+```{r, warning = F, message = F}
+if (!require('pacman')) install.packages('pacman'); library(pacman) # use this package to conveniently install other packages
+  
+ # load (install if required) packages from CRAN
+ p_load("here", "dplyr", "devtools", "scales", "ellipse", "ggplot2", "lazyeval", "igraph", "ggraph", "reshape2", "knitr", "tidyr",
+        "survival", "flexsurv", "data.table", "truncnorm", "demography", "tictoc", "gtools", "tm", "readxl", "survminer", "gridExtra", "grid", "lattice",
+        "survminer", "readxl")                                          
+ 
+ p_load_gh("DARTH-git/dampack") 
+ p_load_gh("DARTH-git/darthtools")
+```
+
+
+# 03 Make KM estimates of observed population 
+```{r, warning = F, message = F}
+datmort <- read_xlsx(here::here("data", "Pooled_KM_Survival_Final_All_Repairs.xlsx"))
+
+head(datmort)
+
+datmort <- transform(datmort, time=time*12)
+
+KM = survfit(Surv(time = as.numeric(datmort$time), datmort$event == "1") ~1, data = datmort)
+
+ggsurvplot(KM, data = datmort, risk.table = T, xlim = c(0,20*12), surv.scale = "percent", pval =F, legend= "none" , xlab = "Time (Months)", break.x.by = 12, title = "Survival", conf.int = T )
+
+summary(KM, time =148)
+
+store = summary(KM, times = c(0:(20*12)))
+mort_MA2 = store$surv
+
+df_mort_MA2 <- data.frame("time"=0:188,"survival" = mort_MA2)
+```
+
+
+
+# 04 Run input parameter for the microsimulation model
+```{r}
+#The model has three health states:
+#A: Alive 
+#D: Dead
+
+### Health states:
+v_names_states <- c("A", "D")      # vector with state names
+n_states       <- length(v_names_states)        # number of states
+
+# Number of individuals to simulate
+n_i         <- 10000 
+
+# Maximum age
+max_age     <- 100
+
+# Set baseline treatment characteristics for all patients
+t_Trt       <- rep(0, n_i) # time since treatment zero at baseline for all patients
+v_intercept <- rep(1, n_i) # intercept for regression formulas to 1 for all patients
+
+# Set the baseline mortality and valve-related events status to zero for all patients
+v_EN <- v_RI <- v_death_early <- v_death <- p_SVD <- RI_SVD <- RI_EN <- D_SVD <- D_EN <- rep(0, n_i) 
+
+# Create patient population
+age       <- 50 
+age_SD    <- 13 
+prop_male <- 0.60 
+min_age   <- 18                                                                      
+
+# Create virtual patient population based on mean/sd age and distribution of males/females
+v_age     <- rtruncnorm(n_i, min_age, 86, age, age_SD)
+v_male    <- rbinom(n_i, 1, prop_male)
+
+# Initial health state of all patients
+v_M_init    <- rep("A", times = n_i)  
+
+# Starting intervention SVR for all patients 
+v_Trt       <- rep("SVR", n_i) 
+
+# Create a data frame with patient characteristics at baseline
+df_X <- data.frame(ID = 1:n_i, Age_int = round(v_age), Age = round(v_age), Age_mo = v_age, Sex = v_male, 
+                   Trt = v_Trt, t_Trt = t_Trt, 
+                   EN = v_EN, RI = v_RI, 
+                   D_early = v_death_early, D = v_death, p_SVD = p_SVD, RI_SVD = RI_SVD, RI_EN = RI_EN,
+                   D_SVD = D_SVD, D_EN = D_EN)
+
+# Time horizon in months
+n_t <- 40*12 
+
+# Background mortality 
+# Log in of HMD
+username                    <-  "r.rhellab@erasmusmc.nl"# Insert Username for HMD
+password                    <-  "Dummycode2024!"# Insert Password for HMD
+year                        <- "2020"
+
+# The code below adapts the HMD data to the right format for use in the model
+r_mort_NL                   <- hmd.mx("NLD", username, password, "Netherlands")
+r_mort_NL_F_allyrs          <- r_mort_NL[["rate"]]$female
+r_mort_NL_M_allyrs          <- r_mort_NL[["rate"]]$male
+r_mort_NL_F                 <- as.data.frame(r_mort_NL_F_allyrs[ , year])
+colnames(r_mort_NL_F)       <- "female"
+r_mort_NL_M                 <- as.data.frame(r_mort_NL_M_allyrs[ , year])
+colnames(r_mort_NL_M)       <- "male"
+r_mort_NL                   <- cbind(r_mort_NL_F, r_mort_NL_M)
+r_mort_NL$Age               <- 0:110
+r_mort_NL                   <- r_mort_NL[complete.cases(r_mort_NL), ]
+r_mort                      <- gather(r_mort_NL, "Sex", "r_D", 1:2) # rearrange the data frame from wide to long
+r_mort$Sex                  <- ifelse(r_mort$Sex == "male", 1, 0)   # create a variable for Sex where '1' is male and '0' is female
+
+# Early valve-related events occur within 30 days after the intervention.
+# The following early valve-related events are included:
+# D: death
+# EN: endocarditis
+
+df_p_early  <- data.frame(D     = c(0.0), 
+                          EN    = c(0.0)) 
+
+rownames(df_p_early)  <- c("SVR") # assign row names
+
+a_p_early <- df_p_early # convert from two-dimensional data frame to three-dimensional array
+
+#Late valve-related events occur beyond 30 days after the intervention.
+#The following late valve-related events are included:
+#SVD: structural valve deterioration
+#EN : endocarditis
+#RI : re-intervention
+#Fill in the linearized occurrence rates of the valve related events.
+
+df_r_late <- data.frame(EN       = c(0.0),
+                        SVD      = c(0.0))
+
+rownames(df_r_late) <- c("SVR")             # assign row names, first row is risks after SVR and second row is risks after TVI.
+df_p_late           <- 1-exp(-df_r_late/12) # convert annual rates to monthly probabilities
+a_p_late            <- df_p_late            # convert from two-dimensional data frame to three-dimensional array
+
+#There are three possible consequences of a late valve-related event:
+#- Death
+#- Re-intervention
+
+#Fill in the probabilities to die after valve-related events in df_p_D.
+#Fill in the probabilities of a re-intervention after valve-related events in df_p_RI.
+
+# Probabilities to die after valve-related events
+df_p_D    <- data.frame(SVD = c(0.0), 
+                        EN  = c(0.0))
+
+# Probabilities of a re-intervention after valve-related events
+df_p_RI   <- data.frame(SVD = c(0.0),    
+                        EN  = c(0.0)) 
+
+# Assign row names, first row is risks after SVR and second row is risks after TVI.
+rownames(df_p_D) <- rownames(df_p_RI) <-c("SVR")
+
+df_HR_EM <- data.frame(Age = seq(0, 109),
+                         SVR = c(rep(1.0, 10),   # HR 0-9 years
+                                 rep(1.0, 10),   # HR 10-19 years
+                                 rep(1.0, 10),   # HR 20-29 years
+                                 rep(1.0, 10),   # HR 30-39 years
+                                 rep(1.0, 10),   # HR 40-49 years
+                                 rep(1.0, 10),   # HR 50-59 years
+                                 rep(1.0, 10),   # HR 60-69 years
+                                 rep(1.0, 10),   # HR 70-79 years
+                                 rep(1.0, 10),   # HR 80-89 years
+                                 rep(1.0, 10),   # HR 90-99 years
+                                 rep(1.0, 10)))  # HR 100-109 years
+
+df_HR_EM_l <- gather(df_HR_EM, "Trt", "HR_EM", 2) # rearrange the data frame from wide to long
+```
+
+
+# 05 Run functions required for microsimulation model and golden-section search
+```{r}
+EarlyRisks <- function(df_X, seed = 1, t) {
+  
+  set.seed(seed) # set the seed of R's random number generator to make sure that results can be reproduced 
+  
+  ## Create an empty matrix m_EE to save the event status of all patients
+  m_EE           <- matrix(0, nrow = n_i, ncol = 2)
+  colnames(m_EE) <- c("D", "EN")
+
+  ## EARLY MORTALITY
+  m_EE[df_X$t_Trt==0 && df_X$RI==0, "D"] <- rbinom(sum(which(df_X$t_Trt == 0 && df_X$RI == 0)), 1, a_p_early["SVR", "D", df_X$Age+1])
+  
+  ## EARLY VALVE-RELATED EVENTS
+  n_SVR <- sum(df_X$t_Trt==0 && df_X$Trt=="SVR") 
+  m_EE[df_X$t_Trt==0 && df_X$Trt=="SVR", "EN" ] <- rbinom(n_SVR, 1, a_p_early["SVR", "EN" , df_X$Age+1])  
+  
+  return(m_EE)
+}
+
+MicroSim_HR <- function(n_i, df_X, seed = 1, HR_auto_1 = HR[i], df_HR, low.segment, up.segement) {
+  
+  df_HR_EM_l2 = df_HR
+  df_HR_EM_l2[df_HR_EM_l2$t>=low.segment & df_HR_EM_l2$t<up.segement,'HR_EM'] = HR_auto_1
+  
+  Probs <- function(M_t, df_X, t) { 
+    # Arguments:
+    # M_t : health state occupied by individual i at cycle t (character variable)
+    # df_X: data frame with individual characteristics data 
+    # t   : current cycle 
+    # Returns: 
+    # transition probabilities for that cycle
+    
+    # Create empty matrix for health state transition probabilities
+    m_p_t                       <- matrix(0, nrow = n_states, ncol = n_i)   
+    rownames(m_p_t)             <- v_names_states  # give the state names to the rows
+    
+    df_HR_EM_l = df_HR_EM_l2[df_HR_EM_l2$t == t,]
+    df_HR_EM_l = df_HR_EM_l[,-3]
+
+    # Determine mortality rate based on patient's age and sex and correct for excess mortality
+    df_mort                     <- inner_join(df_X, r_mort, by = c("Age", "Sex"), ) # look up mortality rate corresponding with age and sex
+    HR_EM                       <- inner_join(df_X, df_HR_EM_l, by = c("Age", "Trt"), ) # look up HR excess mortality corresponding with age and treatment
+    df_mort$r_D[M_t == "A"] <- df_mort$r_D[M_t == "A"]*HR_EM$HR_EM[M_t == "A"] # correct rate for excess mortality in SVR patients
+    df_mort$r_D_mo              <- (1+df_mort$r_D)^(1/12)-1 # convert annual mortality rate to monthly mortality rate
+    df_mort$p_D_Trt             <- 1-exp(-df_mort$r_D_mo) # convert rate to probability
+    df_mort$p_D_Trt             <- ifelse(df_X$Age >= max_age, 1, df_mort$p_D_Trt) # set mortality prob to 1 at max age to end the simulation
+    p_SVRD                      <- df_mort[M_t == "A", "p_D_Trt"] # assign probability to p_SVRD for SVR patients
+    
+    # Update the m_p_r with the appropriate probabilities   
+    # Transition probabilities when alive after SVR (probability to stay in 'A' and to move to 'D')
+    m_p_t[, M_t == "A"]   <- rbind(1 - p_SVRD, p_SVRD)                              
+    
+    # Transition probabilities when dead (zero for move to 'A' and 1 to stay in 'D' so patients stay in death state)   
+    m_p_t[, M_t == "D"]       <- rbind(0, 1)                                                        
+    
+    return(t(m_p_t))
+  }
+  
+  # Arguments:  
+  # n_i:     number of individuals
+  # df_X     data frame with individual characteristics data 
+  # seed:    default is 1
+  
+  set.seed(seed) # set the seed of R‘s random number generator to make sure that results can be reproduced 
+  
+  n_states <- length(v_names_states) # the number of health states
+  
+  # Create matrices to save results
+  # Number of rows is equal to the n_i, the number of columns is equal to n_t + 1 (the initial state and all the n_t cycles)
+  # m_M is used to store the health state information over time for every individual
+  # The other matrices are used to store the event occurrence over time for every individual
+  # The matrices m_SVD and m_EN are used to store the event occurrence over time for every individual
+  m_M <- m_D <- m_SVD <- m_EN <- m_RI <- m_RI_Trt <- 
+    matrix(nrow = n_i, ncol = n_t + 1, 
+           dimnames = list(paste("ind"  , 1:n_i, sep = " "),
+                           paste("cycle", 0:n_t, sep = " ")))  
+  
+  # Create an 3D-array to save the early valve-related events status in every cycle for every individual
+  a_EE <- array(0,                                   
+                dim = c(n_i, 2, n_t + 1),
+                dimnames = list(paste("ind"  , 1:n_i, sep = " "), # name the dimensions of the array 
+                                c("D", "EN"), 
+                                0:n_t)) 
+  
+  # Create matrices for the type of treatment of events
+  # CT: conservative treatment (i.e. no re-intervention)
+  # RI: re-intervention
+  # D:  death
+  m_SVD_Trt <- m_EN_Trt <- matrix(nrow = n_i, ncol = 3,
+                                  dimnames = list(paste("ind", 1:n_i, sep = " "),
+                                                  c("CT", "RI", "D")))
+  
+  ####### Cycle 0 #######
+  m_M [, 1] <- v_M_init # initial health state at cycle 0 (i.e. column 1 of m_M)
+  
+  # Determine early mortality and valve-related events
+  a_EE[ , , 1] <- EarlyRisks(df_X, seed, t = 0)
+  df_X$D_early <- a_EE[ , "D" , 1]
+  
+  # Save cause of death in patients with early mortality
+  m_D[a_EE[ , "D", 1]==1, 1] <- "early_D" 
+  
+  
+  ## UPDATE DYNAMIC VARIABLES FOR NEXT CYCLE
+  # AGE
+  # Update the age of individuals that are alive
+  df_X$Age_mo[a_EE[ , "D", 1]==0]  <- df_X$Age_mo[a_EE[ , "D", 1]==0] + (1/12) 
+  # Round age to be able to extract the mortality rate corresponding with this age from the mortality table
+  df_X$Age[a_EE[ , "D", 1]==0]     <- round(df_X$Age_mo[a_EE[ , "D", 1]==0])
+  
+  ####### Cycle 1 to n_t ####### 
+  
+  # open a loop for time running cycles 1 to n_t 
+  # i.e. the following code will be repeated for every month
+  for (t in 1:n_t) {
+    set.seed(t)
+    
+    # TRANSITIONS BETWEEN HEALTH STATES (i.e. A, D)
+    # Calculate the transition probabilities for the cycle based on  health state t
+    m_P <- Probs(m_M[, t], df_X, t)  
+    
+    # Sample the current health state and store that state in matrix m_M 
+    # t + 1 because first column in m_M is cycle 0 (i.e. the starting health state)
+    m_M[, t + 1]  <- samplev(m_P, 1)
+    
+    # Save cause of death in patients who died due to background/excess mortality
+    m_D[m_M[ , t + 1]=="D" & m_M[ , t] != "D", t + 1] <- "other"  
+    
+    # Override the health state assignment of samplev to "D" if patient died in the previous cycle from valve-related events or after re-intervention
+    m_M[a_EE[ , "D", t]==1, t + 1] <- "D"
+    m_M[, t + 1]  <- ifelse(df_X$D == 1, "D", m_M[, t + 1])
+    
+    # CONSEQUENCES OF RE-INTERVENTION
+    # If a patient had an event in the previous cycle and it was determined they would undergo a re-intervention for the event, the consequences (i.e. early events and update of time since intervention) are modeled here
+    # Save re-intervention status per cycle in matrix
+    m_RI [ , t + 1] <- df_X$RI
+    
+    # Update time since last intervention
+    # If re-intervention in this cycle: reset time after intervention to zero 
+    # If no re-intervention in this cycle: add 1 month to the previous time
+    df_X$t_Trt        <- ifelse(df_X$RI == 1, 0, df_X$t_Trt + 1)
+    # Save age at re-intervention
+    df_X$Age_int <- ifelse(df_X$RI == 1, df_X$Age, df_X$Age_int)
+    
+    # EARLY EVENTS AFTER RE-INTERVENTION
+    # Determine if patients experience early mortality or events after the re-intervention
+    a_EE[ , , t + 1] <- EarlyRisks(df_X, seed = t, t)
+    df_X$D_early <- a_EE[ , "D" , t + 1]
+    
+    # Save cause of death in patients with early mortality
+    m_D[a_EE[ , "D", t + 1]==1, t + 1] <- "early_D_RI"
+    
+    # Update time since last intervention to 1 after re-intervention
+    df_X$t_Trt       <- ifelse(df_X$RI == 1, 1, df_X$t_Trt) 
+    
+    # Reset the re-intervention status to zero for all patients 
+    df_X$RI <- 0
+    
+    ## LATE VALVE-RELATED EVENTS
+    # Determine if a valve-related event happens for patients who are not dead
+    df_X$EN [m_M[ , t + 1]=="A"] <- rbinom(sum(m_M[ , t + 1]=="A", na.rm = T), 1, a_p_late["SVR", "EN" , df_X$Age+1])
+    
+    # Determine if SVD happens for patients who are not dead 
+    df_X$SVD [m_M[ , t + 1]=="A"] <- rbinom(sum(m_M[ , t + 1]=="A"), 1, a_p_late["SVR", "SVD" , df_X$Age+1])
+    df_X$SVD [m_M[ , t + 1]=="D"] <- 0
+    
+    # Save event status per cycle in matrices 
+    m_SVD[, t + 1] <- df_X$SVD 
+    m_EN [, t + 1] <- df_X$EN   
+    
+    # ## CONSEQUENCES OF VALVE-RELATED EVENTS
+    # # Determine if patients get conservative treatment, re-intervention or die after the event
+    # # This returns a data frame with three values: 2 zeros and 1 one. The consequence with 1 is what happens
+    m_SVD_Trt[m_M[,t + 1]=="A" ] <- t(rmultinom(sum(m_M[,t + 1]=="A"), 1, 
+                                                c(1-df_p_RI["SVR", "SVD" ]-df_p_D["SVR", "SVD"],  
+                                                  df_p_RI["SVR", "SVD"],  
+                                                  df_p_D["SVR", "SVD"])))
+    
+    
+    m_EN_Trt [m_M[,t + 1]=="A"] <- t(rmultinom(sum(m_M[,t + 1]=="A"), 1, 
+                                               c(1-df_p_RI["SVR", "EN" ]-df_p_D["SVR", "EN"],  
+                                                 df_p_RI["SVR", "EN"],  
+                                                 df_p_D["SVR", "EN"])))
+    
+    # REINTERVENTION AFTER EVENTS
+    df_X$RI_SVD <- ifelse(df_X$SVD == 1, m_SVD_Trt[df_X$SVD == 1, 2], 0)
+    df_X$RI_EN  <- ifelse(df_X$EN  == 1, m_EN_Trt [df_X$EN  == 1, 2], 0)
+    
+    # Calculate the sum of the re-intervention variables and change to 1 if the patient was assigned a re-intervention for multiple events in the same cycle
+    df_X$RI <- rowSums(df_X[c("RI_SVD", "RI_EN")])
+    df_X$RI[df_X$RI > 1] <- 1
+    
+    # MORTALITY AFTER EVENTS
+    df_X$D_SVD <- ifelse(df_X$SVD == 1, m_SVD_Trt[df_X$SVD == 1, 3], 0)
+    df_X$D_EN  <- ifelse(df_X$EN  == 1, m_EN_Trt [df_X$EN  == 1, 3], 0)
+    
+    # Calculate the sum of the death variables and change to 1 if the patient died due to multiple events in the same cycle
+    df_X$D <- rowSums(df_X[c("D_SVD", "D_EN")])
+    df_X$D[df_X$D > 1] <- 1
+    
+    # Save the cause of death
+    m_D[df_X$D_SVD == 1, t + 1] <- "SVD"
+    m_D[df_X$D_EN  == 1, t + 1] <- "EN"
+    
+    
+    ## UPDATE DYNAMIC VARIABLES FOR NEXT CYCLE
+    
+    # AGE
+    # Update the age of individuals that are alive
+    df_X$Age_mo[m_M[, t + 1] != "D"]  <- df_X$Age_mo[m_M[, t + 1] != "D"] + (1/12) 
+    # Round age to be able to extract the mortality rate corresponding with this age from the mortality table
+    df_X$Age[m_M[, t + 1] != "D"]     <- round(df_X$Age_mo[m_M[, t + 1] != "D"])
+    
+    # VALVE-RELATED EVENT STATUS
+    ## Return all df_X event variables to zero
+    df_X$SVD <- df_X$EN <- 0
+    
+    ## DISPLAY SIMULATION PROGRESS
+    if(t/(n_t/10) == round(t/(n_t/10), 0)) { # display progress every 10%
+      cat('\r', paste(t/n_t * 100, "% done", sep = " "))
+    }
+    
+  } # close the loop for the cycles 
+
+  ## STORE RESULTS 
+  # Store the results from the simulation in a list
+  # To speed up the simulation you can remove the matrices that you will not report
+  results <- list(m_M = m_M, m_D = m_D, a_EE = a_EE,
+                  m_SVD = m_SVD,m_EN = m_EN,
+                  m_RI = m_RI, m_RI_Trt = m_RI_Trt)
+  
+  return(results)  # return the results
+  
+}
+```
+
+
+# 06 Run the plot least squares function
+```{r}
+plot_least_square_HR = function(range_HR = c(0,50), steps_HR = 1, mort_MA , matrix_segment = m_segment, dfHR){
+    
+    dfHR_within_function = dfHR
+    HR =  seq(from = range_HR[1], to = range_HR[2], by = steps_HR)
+    st.lsq = array(dim = c(length(HR), 2,nrow(matrix_segment)))
+    colnames(st.lsq) = c("HR_EM", "Squared.Resids")
+    print(paste("Number of rounds", length(HR), "for", nrow(matrix_segment), "segments (Total:", length(HR)*nrow(matrix_segment), "rounds)",  sep = " "))  
+    range_HR <- round(range_HR, 2)
+
+      for(j in 1:nrow(matrix_segment)){
+      
+      
+              for(i in 1:length(HR)){
+              
+              outcomes = MicroSim_HR(n_i, df_X, seed = 1, HR_auto_1 = HR[i], df_HR= dfHR_within_function, low.segment = matrix_segment[j,1], up.segement = matrix_segment[j,2])
+              
+              # Determine proportion of patients in every health state in every cycle
+              df_M  <- (t(apply(outcomes$m_M, 2, function(x) table(factor(x, levels = v_names_states, ordered = TRUE)))))/n_i
+              
+              # Save results in a data frame
+              df_M <- data.frame(time = seq(0, n_t),
+                                    A = df_M [,1],
+                                    D = df_M [,2]) 
+              
+              mort_MA3 = mort_MA[matrix_segment[j,1]:matrix_segment[j,2]]
+              st2 = df_M$A[matrix_segment[j,1]:matrix_segment[j,2]]
+              
+              st.lsq[i,1,j] = HR[i]
+              st.lsq[i,2,j] = sum((mort_MA3-st2)*(mort_MA3-st2))
+              
+              dfHR_within_function[dfHR_within_function$t>=matrix_segment[j,1] & dfHR_within_function$t<matrix_segment[j,2],'HR_EM'] =   st.lsq[which.min(st.lsq[,2,j]),1,j]
+              
+              }
+        
+        print(paste("Working with HR of", st.lsq[which.min(st.lsq[,2,j]),1,j], "for the next segment" , sep = " "))    
+      
+        }  
+
+  return(list(st.lsq,dfHR_within_function))
+
+}
+```
+
+
+# 07 Run the optimization function
+```{r}
+optimize_HR_EM = function(upper_bound = 50, lower_bound = 0, matrix_segment, mort_MA, dfHR){
+  matrix_segment2 = matrix_segment
+  mort_MA4 = mort_MA
+  dfHR2 = dfHR
+  f = function(x, matrix_segment = matrix_segment2, dfHR = dfHR2){ 
+  as.numeric(plot_least_square_HR(range_HR = round(c(x, x),2), steps_HR =0.1 , mort_MA = mort_MA4, matrix_segment = matrix_segment2, dfHR = dfHR2)[[1]][1,2,1])
+  }
+
+ans = optimize(f, interval = c(lower_bound, upper_bound), tol = 0.05)
+HR = ans$minimum
+
+return(HR)
+
+}
+```
+
+# 08 Declare segments 
+```{r}
+v_segment = c(0, 188) #0, 60, 60, 120, 120, 188 
+m_segment = matrix(v_segment,  ncol = 2,nrow = 3, byrow = T) #if you have adjusted the number of segments above, adjust nrow accordingly
+
+newDF <- with(df_HR_EM_l, expand.grid("Age"= unique(Age),
+                                      "Trt"= unique(Trt),
+                                      "t" = 0:n_t,
+                                      "HR_EM" = 1))
+
+df_HR_EM_l2 <- newDF
+```
+
+# Incremental search 
+```{r, warning=F}
+# Define the range and step size for HR values
+hr_range <- c(0.1, 10.0)
+hr_step <- 0.1  # smaller step = finer grid
+
+# Define the segment over which to test (e.g., full range)
+segment_matrix <- matrix(c(0, 188), ncol = 2)
+
+# Run the least squares function over all HRs
+lsq_output <- plot_least_square_HR(
+  range_HR = hr_range,
+  steps_HR = hr_step,
+  mort_MA = mort_MA2,
+  matrix_segment = segment_matrix,
+  dfHR = newDF
+)
+
+# Extract HRs and sum of squared residuals
+HRs <- lsq_output[[1]][,1,1]
+SSR <- lsq_output[[1]][,2,1]
+
+# Plot the results
+plot(HRs, SSR, type = "b", pch = 19, lwd = 2,
+     xlab = "HR Value", ylab = "Sum of Squared Residuals (SSR)",
+     main = "HR vs Sum of Squared Residuals")
+grid()
+
+```
+
+# 09 Optimize HR for each segment and insert resulting value into the existing dataframe
+```{r, warning=FALSE}
+# If you have adjusted the number of segments in section 08 adjust the code below accordingly (m_segment[..., ])
+
+HR_test0 = optimize_HR_EM(mort_MA = mort_MA2, dfHR = newDF, matrix_segment = matrix(m_segment[1,], nrow = 1))
+newDF$HR_EM[newDF$t<60] = HR_test0
+
+HR_test1 = optimize_HR_EM(mort_MA = mort_MA2, dfHR = newDF, matrix_segment = matrix(m_segment[2,], nrow = 1))
+newDF$HR_EM[newDF$t>=60 & newDF$t<120] = HR_test1
+
+HR_test2 = optimize_HR_EM(mort_MA = mort_MA2, dfHR = newDF, matrix_segment = matrix(m_segment[3,], nrow = 1))
+newDF$HR_EM[newDF$t>=120] = HR_test2
+```
+
+# 10 Check calibration using HR estimation by golden-section search
+```{r}
+df_HR_EM_l2 <- newDF
+
+Probs <- function(M_t, df_X, t) { 
+    # Arguments:
+    # M_t : health state occupied by individual i at cycle t (character variable)
+    # df_X: data frame with individual characteristics data 
+    # t   : current cycle 
+    # Returns: 
+    # transition probabilities for that cycle
+    
+    # Create empty matrix for health state transition probabilities
+    m_p_t                       <- matrix(0, nrow = n_states, ncol = n_i)   
+    rownames(m_p_t)             <- v_names_states  # give the state names to the rows
+    
+    df_HR_EM_l = df_HR_EM_l2[df_HR_EM_l2$t == t,]
+    df_HR_EM_l = df_HR_EM_l[,-3]
+    
+    # Determine mortality rate based on patient's age and sex and correct for excess mortality
+    df_mort                     <- inner_join(df_X, r_mort, by = c("Age", "Sex"), ) # look up mortality rate corresponding with age and sex
+    HR_EM                       <- inner_join(df_X, df_HR_EM_l, by = c("Age", "Trt"), ) # look up HR excess mortality corresponding with age and treatment
+    df_mort$r_D[M_t == "A"] <- df_mort$r_D[M_t == "A"]*HR_EM$HR_EM[M_t == "A"] # correct rate for excess mortality in SVR patients
+    df_mort$r_D_mo              <- (1+df_mort$r_D)^(1/12)-1 # convert annual mortality rate to monthly mortality rate
+    df_mort$p_D_Trt             <- 1-exp(-df_mort$r_D_mo) # convert rate to probability
+    df_mort$p_D_Trt             <- ifelse(df_X$Age >= max_age, 1, df_mort$p_D_Trt) # set mortality prob to 1 at max age to end the simulation
+    p_SVRD                      <- df_mort[M_t == "A", "p_D_Trt"] # assign probability to p_SVRD for SVR patients
+    
+    # Update the m_p_r with the appropriate probabilities   
+    # Transition probabilities when alive after SVR (probability to stay in 'A_SVR', move to 'A_TVI', move to 'D')
+    m_p_t[, M_t == "A"]   <- rbind(1 - p_SVRD, p_SVRD)                              
+    
+    # Transition probabilities when dead (zero for move to 'A_SVR' and 'A_TVI' and 1 to stay in 'D' so patients stay in death state)   
+    m_p_t[, M_t == "D"]       <- rbind(0, 1)                                                        
+    
+    return(t(m_p_t))
+  }
+  
+MicroSim <- function(n_i, df_X, seed = 1) {
+# Arguments:  
+  # n_i:     number of individuals
+  # df_X     data frame with individual characteristics data 
+  # seed:    default is 1
+  
+  set.seed(seed) # set the seed of R‘s random number generator to make sure that results can be reproduced 
+  
+  n_states <- length(v_names_states) # the number of health states
+  
+  # Create matrices to save results
+  # Number of rows is equal to the n_i, the number of columns is equal to n_t + 1 (the initial state and all the n_t cycles)
+  # m_M is used to store the health state information over time for every individual
+  # m_C is used to store the costs information over time for every individual
+  # m_E is used to store the effects information over time for every individual
+  # The other matrices are used to store the event occurrence over time for every individual
+  # The matrices m_CVA, m_BL, m_SVD, m_NSD, m_VT and m_EN are used to store the event occurrence over time for every individual
+  m_M <- m_D <- m_SVD <- m_EN <- m_RI <- m_RI_Trt <- 
+  matrix(nrow = n_i, ncol = n_t + 1, 
+  dimnames = list(paste("ind"  , 1:n_i, sep = " "),
+  paste("cycle", 0:n_t, sep = " ")))  
+  
+  # Create an 3D-array to save the early valve-related events status in every cycle for every individual
+  a_EE <- array(0,                                   
+                dim = c(n_i, 2, n_t + 1),
+                dimnames = list(paste("ind"  , 1:n_i, sep = " "), # name the dimensions of the array 
+                                c("D", "EN"), 
+                                0:n_t)) 
+  
+  # Create matrices for the type of treatment of events
+  # CT: conservative treatment (i.e. no re-intervention)
+  # RI: re-intervention
+  # D:  death
+  m_SVD_Trt <- m_EN_Trt <- matrix(nrow = n_i, ncol = 3,
+                                                dimnames = list(paste("ind", 1:n_i, sep = " "),
+                                                              c("CT", "RI", "D")))
+  
+  ####### Cycle 0 #######
+  m_M [, 1] <- v_M_init # initial health state at cycle 0 (i.e. column 1 of m_M)
+  
+  # Determine early mortality and valve-related events
+  a_EE[ , , 1] <- EarlyRisks(df_X, seed, t = 0)
+  df_X$D_early <- a_EE[ , "D" , 1]
+  
+  # Save cause of death in patients with early mortality
+  m_D[a_EE[ , "D", 1]==1, 1] <- "early_D" 
+  
+
+    ## UPDATE DYNAMIC VARIABLES FOR NEXT CYCLE
+  # AGE
+  # Update the age of individuals that are alive
+  df_X$Age_mo[a_EE[ , "D", 1]==0]  <- df_X$Age_mo[a_EE[ , "D", 1]==0] + (1/12) 
+  # Round age to be able to extract the mortality rate corresponding with this age from the mortality table
+  df_X$Age[a_EE[ , "D", 1]==0]     <- round(df_X$Age_mo[a_EE[ , "D", 1]==0])
+  
+  ####### Cycle 1 to n_t ####### 
+  
+    # open a loop for time running cycles 1 to n_t 
+    # i.e. the following code will be repeated for every month
+    for (t in 1:n_t) {
+      set.seed(t)
+
+      # TRANSITIONS BETWEEN HEALTH STATES (i.e. A_SVR, D)
+      # Calculate the transition probabilities for the cycle based on  health state t
+      m_P <- Probs(m_M[, t], df_X, t)  
+      
+      # Sample the current health state and store that state in matrix m_M 
+      # t + 1 because first column in m_M is cycle 0 (i.e. the starting health state)
+      m_M[, t + 1]  <- samplev(m_P, 1)
+
+      # Save cause of death in patients who died due to background/excess mortality
+      m_D[m_M[ , t + 1]=="D" & m_M[ , t] != "D", t + 1] <- "other"  
+      
+      # Override the health state assignment of samplev to "D" if patient died in the previous cycle from valve-related events or after re-intervention
+      m_M[a_EE[ , "D", t]==1, t + 1] <- "D"
+      m_M[, t + 1]  <- ifelse(df_X$D == 1, "D", m_M[, t + 1])
+      
+      # CONSEQUENCES OF RE-INTERVENTION
+      # If a patient had an event in the previous cycle and it was determined they would undergo a re-intervention for the event, the consequences (i.e. early events and update of time since intervention) are modeled here
+          # Save re-intervention status per cycle in matrix
+      m_RI [ , t + 1] <- df_X$RI
+
+      
+      # Update time since last intervention
+      # If re-intervention in this cycle: reset time after intervention to zero 
+      # If no re-intervention in this cycle: add 1 month to the previous time
+      df_X$t_Trt        <- ifelse(df_X$RI == 1, 0, df_X$t_Trt + 1)
+      # Save age at re-intervention
+      df_X$Age_int <- ifelse(df_X$RI == 1, df_X$Age, df_X$Age_int)
+      
+      # EARLY EVENTS AFTER RE-INTERVENTION
+      # Determine if patients experience early mortality or events after the re-intervention
+      a_EE[ , , t + 1] <- EarlyRisks(df_X, seed = t, t)
+      df_X$D_early <- a_EE[ , "D" , t + 1]
+        
+      # Save cause of death in patients with early mortality
+      m_D[a_EE[ , "D", t + 1]==1, t + 1] <- "early_D_RI"
+      
+      # Update time since last intervention to 1 after re-intervention
+      df_X$t_Trt       <- ifelse(df_X$RI == 1, 1, df_X$t_Trt) 
+      
+      # Reset the re-intervention status to zero for all patients 
+      df_X$RI <- 0
+    
+      ## LATE VALVE-RELATED EVENTS
+      # Determine if a valve-related event happens for patients who are not dead
+      df_X$EN [m_M[ , t + 1]=="A"] <- rbinom(sum(m_M[ , t + 1]=="A", na.rm = T), 1, a_p_late["SVR", "EN" , df_X$Age+1])
+      df_X$EN [m_M[ , t + 1]=="D"]
+      # Determine if SVD happens for patients who are not dead 
+      df_X$SVD [m_M[ , t + 1]=="A"] <- rbinom(sum(m_M[ , t + 1]=="A"), 1, a_p_late["SVR", "SVD" , df_X$Age+1])
+      df_X$SVD [m_M[ , t + 1]=="D"] <- 0
+      
+      # Save event status per cycle in matrices 
+      m_SVD[, t + 1] <- df_X$SVD 
+      m_EN [, t + 1] <- df_X$EN   
+      
+      # ## CONSEQUENCES OF VALVE-RELATED EVENTS
+      # # Determine if patients get conservative treatment, re-intervention or die after the event
+      # # This returns a data frame with three values: 2 zeros and 1 one. The consequence with 1 is what happens
+      m_SVD_Trt[m_M[,t + 1]=="A" ] <- t(rmultinom(sum(m_M[,t + 1]=="A"), 1, 
+                                                     c(1-df_p_RI["SVR", "SVD" ]-df_p_D["SVR", "SVD"],  
+                                                       df_p_RI["SVR", "SVD"],  
+                                                       df_p_D["SVR", "SVD"])))
+      
+      
+      m_EN_Trt [m_M[,t + 1]=="A"] <- t(rmultinom(sum(m_M[,t + 1]=="A"), 1, 
+                                                     c(1-df_p_RI["SVR", "EN" ]-df_p_D["SVR", "EN"],  
+                                                       df_p_RI["SVR", "EN"],  
+                                                       df_p_D["SVR", "EN"])))
+      
+      # REINTERVENTION AFTER EVENTS
+      # Determine who undergoes a re-intervention for the event
+      # If a patient had the event, take the second column from the consequences of event data frame for everyone with the event. 
+      # This is either a zero (no re-intervention) or a one (re-intervention)
+      df_X$RI_SVD <- ifelse(df_X$SVD == 1, m_SVD_Trt[df_X$SVD == 1, 2], 0)
+      df_X$RI_EN  <- ifelse(df_X$EN  == 1, m_EN_Trt [df_X$EN  == 1, 2], 0)
+      
+      # Calculate the sum of the re-intervention variables and change to 1 if the patient was assigned a re-intervention for multiple events in the same cycle
+      df_X$RI <- rowSums(df_X[c("RI_SVD", "RI_EN")])
+      df_X$RI[df_X$RI > 1] <- 1
+      
+      # MORTALITY AFTER EVENTS
+      # Determine who dies from the event within the cycle
+      df_X$D_SVD <- ifelse(df_X$SVD == 1, m_SVD_Trt[df_X$SVD == 1, 3], 0)
+      df_X$D_EN  <- ifelse(df_X$EN  == 1, m_EN_Trt [df_X$EN  == 1, 3], 0)
+      
+      # Calculate the sum of the death variables and change to 1 if the patient died due to multiple events in the same cycle
+      df_X$D <- rowSums(df_X[c("D_SVD", "D_EN")])
+      df_X$D[df_X$D > 1] <- 1
+      
+      # Save the cause of death
+      m_D[df_X$D_SVD == 1, t + 1] <- "SVD"
+      m_D[df_X$D_EN  == 1, t + 1] <- "EN"
+    
+
+      ## UPDATE DYNAMIC VARIABLES FOR NEXT CYCLE
+      # AGE
+      # Update the age of individuals that are alive
+      df_X$Age_mo[m_M[, t + 1] != "D"]  <- df_X$Age_mo[m_M[, t + 1] != "D"] + (1/12) 
+      # Round age to be able to extract the mortality rate corresponding with this age from the mortality table
+      df_X$Age[m_M[, t + 1] != "D"]     <- round(df_X$Age_mo[m_M[, t + 1] != "D"])
+    
+      # VALVE-RELATED EVENT STATUS
+      ## Return all df_X event variables to zero
+      df_X$SVD <- df_X$EN <- 0
+    
+      ## DISPLAY SIMULATION PROGRESS
+      if(t/(n_t/10) == round(t/(n_t/10), 0)) { # display progress every 10%
+        cat('\r', paste(t/n_t * 100, "% done", sep = " "))
+      }
+      
+    } # close the loop for the cycles 
+
+  ## STORE RESULTS 
+  # Store the results from the simulation in a list
+  # To speed up the simulation you can remove the matrices that you will not report
+  results <- list(m_M = m_M, m_D = m_D, a_EE = a_EE,
+                  m_SVD = m_SVD,m_EN = m_EN,
+                  m_RI = m_RI, m_RI_Trt = m_RI_Trt)
+  
+  return(results)  # return the results
+  
+}
+
+# Run the microsimulation
+outcomes <- MicroSim(n_i, df_X, seed = 1)
+
+# Determine proportion of patients in every health state in every cycle
+df_M  <- (t(apply(outcomes$m_M, 2, function(x) table(factor(x, levels = v_names_states, ordered = TRUE)))))/n_i
+
+# Save results in a data frame
+df_M <- data.frame(time = seq(0, n_t),
+                   A = df_M[,1],
+                   D     = df_M[,2]) # Determine proportion of patients alive 
+
+p.plot = ggsurvplot(KM, data = datmort, risk.table = T, xlim = c(0,20*12), surv.scale = "percent", pval =F , xlab = "Time (Months)", ylab = "Survival",break.x.by = 24, title = "Mortality", conf.int = F, risk.table.y.text = T, legend= "none", censor.shape ="")
+
+p = p.plot$plot  + geom_line(data=df_M, aes(x=time,y=A), size = 0.8)
+
+lay = rbind(c(NA,1),
+            c(2,2))
+
+grid.arrange(p, p.plot$table, layout_matrix = lay, heights=c(3,1), widths = c(-.5,35))
+```
+
+
+
+
+
+
+
+
+
+
+
+
