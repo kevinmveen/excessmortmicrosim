@@ -31,7 +31,8 @@ if (!require('pacman')) install.packages('pacman'); library(pacman) # use this p
 
 # 03 Make KM estimates of observed population 
 ```{r, warning = F, message = F}
-datmort <- read_xlsx(here::here("data", "Pooled_KM_Survival_Final_All_Repairs.xlsx"))
+#Load the r enviroment here (.RData) - this has been published on the Github
+load("FILE_PATH.Rdata")
 
 head(datmort)
 
