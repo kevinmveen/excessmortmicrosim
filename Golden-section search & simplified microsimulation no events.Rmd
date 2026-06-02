@@ -103,8 +103,8 @@ n_t <- 40*12
 
 # Background mortality 
 # Log in of HMD
-username                    <-  "r.rhellab@erasmusmc.nl"# Insert Username for HMD
-password                    <-  "Dummycode2024!"# Insert Password for HMD
+username                    <-  "JOHN.DOE@exampleemail.com"# Insert Username for HMD (fictive example given)
+password                    <-  "enterpassword"# Insert Password for HMD (fictive example given)
 year                        <- "2020"
 
 # The code below adapts the HMD data to the right format for use in the model
