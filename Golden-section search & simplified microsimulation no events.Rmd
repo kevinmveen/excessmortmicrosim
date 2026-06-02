@@ -193,11 +193,11 @@ EarlyRisks <- function(df_X, seed = 1, t) {
   colnames(m_EE) <- c("D", "EN")
 
   ## EARLY MORTALITY
-  m_EE[df_X$t_Trt==0 && df_X$RI==0, "D"] <- rbinom(sum(which(df_X$t_Trt == 0 && df_X$RI == 0)), 1, a_p_early["SVR", "D", df_X$Age+1])
+  m_EE[df_X$t_Trt==0 & df_X$RI==0, "D"] <- rbinom(sum(which(df_X$t_Trt == 0 & df_X$RI == 0)), 1, a_p_early["SVR", "D", df_X$Age+1])
   
   ## EARLY VALVE-RELATED EVENTS
-  n_SVR <- sum(df_X$t_Trt==0 && df_X$Trt=="SVR") 
-  m_EE[df_X$t_Trt==0 && df_X$Trt=="SVR", "EN" ] <- rbinom(n_SVR, 1, a_p_early["SVR", "EN" , df_X$Age+1])  
+  n_SVR <- sum(df_X$t_Trt==0 & df_X$Trt=="SVR") 
+  m_EE[df_X$t_Trt==0 & df_X$Trt=="SVR", "EN" ] <- rbinom(n_SVR, 1, a_p_early["SVR", "EN" , df_X$Age+1])  
   
   return(m_EE)
 }
